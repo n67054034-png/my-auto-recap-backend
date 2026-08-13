@@ -27,9 +27,9 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# =========================
-# HOME
-# =========================
+class RecapRequest(BaseModel):
+    text: str
+
 
 @app.get("/")
 def home():
@@ -39,10 +39,6 @@ def home():
     }
 
 
-# =========================
-# HEALTH
-# =========================
-
 @app.get("/health")
 def health():
     return {
@@ -50,9 +46,45 @@ def health():
     }
 
 
-# =========================
-# TRANSCRIBE VIDEO
-# =========================
+def generate_recap(text: str):
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured"
+        )
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": """
+You are a professional Myanmar movie recap writer.
+
+Convert the provided transcript into a natural Burmese movie recap.
+
+Rules:
+- Write only in Burmese.
+- Do not include English.
+- Keep the important story events.
+- Make the narration smooth and easy to understand.
+- Do not add events that are not in the transcript.
+- Do not use bullet points.
+- Write as a continuous movie recap narration.
+- Do not mention that you are an AI.
+"""
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ],
+        temperature=0.3,
+        max_tokens=4000
+    )
+
+    return response.choices[0].message.content
+
 
 @app.post("/transcribe")
 async def transcribe_video(file: UploadFile = File(...)):
@@ -72,8 +104,6 @@ async def transcribe_video(file: UploadFile = File(...)):
         "audio/wav",
         "audio/x-wav",
         "audio/webm",
-        "audio/flac",
-        "audio/ogg",
     }
 
     if file.content_type not in allowed_types:
@@ -82,9 +112,7 @@ async def transcribe_video(file: UploadFile = File(...)):
             detail="Unsupported file type"
         )
 
-    suffix = os.path.splitext(
-        file.filename or ""
-    )[1] or ".mp4"
+    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
 
     with tempfile.NamedTemporaryFile(
         delete=False,
@@ -126,20 +154,19 @@ async def transcribe_video(file: UploadFile = File(...)):
             pass
 
 
-# =========================
-# RECAP REQUEST MODEL
-# =========================
-
-class RecapRequest(BaseModel):
-    text: str
-
-
-# =========================
-# GENERATE BURMESE RECAP
-# =========================
-
 @app.post("/recap")
-def generate_recap(request: RecapRequest):
+def recap(request: RecapRequest):
+
+    recap_text = generate_recap(request.text)
+
+    return {
+        "success": True,
+        "recap": recap_text
+    }
+
+
+@app.post("/auto-recap")
+async def auto_recap(file: UploadFile = File(...)):
 
     if client is None:
         raise HTTPException(
@@ -147,64 +174,54 @@ def generate_recap(request: RecapRequest):
             detail="GROQ_API_KEY is not configured"
         )
 
-    if not request.text.strip():
+    allowed_types = {
+        "video/mp4",
+        "video/quicktime",
+        "video/x-matroska",
+        "audio/mpeg",
+        "audio/mp4",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/webm",
+    }
+
+    if file.content_type not in allowed_types:
         raise HTTPException(
             status_code=400,
-            detail="Text is required"
+            detail="Unsupported file type"
         )
 
-    prompt = f"""
-You are a professional Burmese movie recap writer.
+    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
 
-Convert the following movie/video transcript into a natural,
-easy-to-understand Burmese movie recap.
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix
+    ) as temp:
 
-IMPORTANT RULES:
-
-1. Write ONLY in Burmese.
-2. Do NOT write English sentences.
-3. Do NOT translate word-by-word.
-4. Make it sound like a natural Burmese movie recap narrator.
-5. Keep the important story events.
-6. Remove unnecessary repetition.
-7. Keep character names when they are clearly known.
-8. Explain events in the correct chronological order.
-9. Do not invent major events that are not in the transcript.
-10. Make the narration interesting and easy to follow.
-11. Do not add a title unless necessary.
-12. Do not use bullet points.
-13. Write as continuous narration suitable for a TikTok/movie recap voice-over.
-
-TRANSCRIPT:
-
-{request.text}
-"""
+        temp.write(await file.read())
+        temp_path = temp.name
 
     try:
 
-        result = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert Burmese movie recap writer. "
-                        "Always produce natural Burmese narration."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.4,
-            max_completion_tokens=8192,
-        )
+        # STEP 1: Video -> Text
+        with open(temp_path, "rb") as audio_file:
 
-        recap_text = result.choices[0].message.content
+            transcription = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3-turbo",
+                response_format="verbose_json",
+                temperature=0.0,
+            )
+
+        transcript_text = transcription.text
+
+        # STEP 2: Text -> Myanmar Movie Recap
+        recap_text = generate_recap(transcript_text)
 
         return {
             "success": True,
+            "filename": file.filename,
+            "transcript": transcript_text,
             "recap": recap_text
         }
 
@@ -213,4 +230,11 @@ TRANSCRIPT:
         raise HTTPException(
             status_code=500,
             detail=str(e)
-    )
+        )
+
+    finally:
+
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
