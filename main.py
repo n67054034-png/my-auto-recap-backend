@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 import imageio_ffmpeg
+from faster_whisper import WhisperModel
 
 
 app = FastAPI(title="My Auto Recap API")
@@ -21,6 +22,12 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------
+# GROQ
+# Used temporarily for Myanmar recap generation.
+# We will replace this later with a free solution.
+# --------------------------------------------------
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
@@ -29,17 +36,46 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
+# --------------------------------------------------
+# FREE WHISPER
+# --------------------------------------------------
+
+WHISPER_MODEL = os.getenv(
+    "WHISPER_MODEL",
+    "tiny"
+)
+
+print("Loading Free Whisper model:", WHISPER_MODEL)
+
+whisper_model = WhisperModel(
+    WHISPER_MODEL,
+    device="cpu",
+    compute_type="int8"
+)
+
+print("Free Whisper model loaded.")
+
+
 class RecapRequest(BaseModel):
     text: str
 
+
+# --------------------------------------------------
+# HOME
+# --------------------------------------------------
 
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "service": "My Auto Recap API"
+        "service": "My Auto Recap API",
+        "transcription": "Free faster-whisper"
     }
 
+
+# --------------------------------------------------
+# HEALTH
+# --------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -47,6 +83,11 @@ def health():
         "status": "ok"
     }
 
+
+# --------------------------------------------------
+# GENERATE MYANMAR RECAP
+# TEMPORARILY USING GROQ
+# --------------------------------------------------
 
 def generate_recap(text: str):
 
@@ -88,78 +129,61 @@ Rules:
     return response.choices[0].message.content
 
 
-@app.post("/recap")
-def recap(request: RecapRequest):
+# --------------------------------------------------
+# FREE TRANSCRIPTION FUNCTION
+# --------------------------------------------------
 
-    recap_text = generate_recap(request.text)
+def transcribe_audio(audio_path: str):
+
+    segments, info = whisper_model.transcribe(
+        audio_path,
+        beam_size=5,
+        vad_filter=True
+    )
+
+    transcript_parts = []
+    timestamped_segments = []
+
+    for segment in segments:
+
+        text = segment.text.strip()
+
+        if text:
+
+            transcript_parts.append(text)
+
+            timestamped_segments.append({
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": text
+            })
 
     return {
-        "success": True,
-        "recap": recap_text
+        "text": " ".join(transcript_parts),
+        "segments": timestamped_segments,
+        "language": info.language,
+        "language_probability": round(
+            info.language_probability,
+            4
+        ),
+        "duration": round(
+            info.duration,
+            2
+        )
     }
 
 
+# --------------------------------------------------
+# TRANSCRIBE VIDEO
+# FREE WHISPER
+# --------------------------------------------------
+
 @app.post("/transcribe")
-async def transcribe_video(file: UploadFile = File(...)):
+async def transcribe_video(
+    file: UploadFile = File(...)
+):
 
-    if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured"
-        )
-
-    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
-
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix
-    ) as temp:
-
-        temp.write(await file.read())
-        temp_path = temp.name
-
-    try:
-
-        with open(temp_path, "rb") as audio_file:
-
-            result = client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3-turbo",
-                response_format="verbose_json",
-                temperature=0.0,
-            )
-
-        return {
-            "success": True,
-            "filename": file.filename,
-            "text": result.text
-        }
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-    finally:
-
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
-
-
-@app.post("/auto-recap")
-async def auto_recap(file: UploadFile = File(...)):
-
-    if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured"
-        )
-
-    input_suffix = os.path.splitext(
+    suffix = os.path.splitext(
         file.filename or ""
     )[1] or ".mp4"
 
@@ -169,28 +193,33 @@ async def auto_recap(file: UploadFile = File(...)):
     try:
 
         # Save uploaded video
+
         with tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=input_suffix
+            suffix=suffix
         ) as temp:
 
             temp.write(await file.read())
             input_path = temp.name
 
 
-        # Get ffmpeg bundled with imageio-ffmpeg
+        # Get FFmpeg
+
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
 
-        # Convert video audio to small MP3
-        audio_file = tempfile.NamedTemporaryFile(
+        # Create audio file
+
+        audio_temp = tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=".mp3"
+            suffix=".wav"
         )
 
-        audio_path = audio_file.name
-        audio_file.close()
+        audio_path = audio_temp.name
+        audio_temp.close()
 
+
+        # Extract audio
 
         subprocess.run(
             [
@@ -203,8 +232,8 @@ async def auto_recap(file: UploadFile = File(...)):
                 "1",
                 "-ar",
                 "16000",
-                "-b:a",
-                "48k",
+                "-acodec",
+                "pcm_s16le",
                 audio_path
             ],
             check=True,
@@ -213,33 +242,175 @@ async def auto_recap(file: UploadFile = File(...)):
         )
 
 
-        # Transcribe compressed audio
-        with open(audio_path, "rb") as audio:
+        # FREE WHISPER
 
-            result = client.audio.transcriptions.create(
-                file=audio,
-                model="whisper-large-v3-turbo",
-                response_format="verbose_json",
-                temperature=0.0
-            )
-
-
-        transcript = result.text
-
-
-        # Generate Burmese recap
-        recap_text = generate_recap(transcript)
+        result = transcribe_audio(
+            audio_path
+        )
 
 
         return {
             "success": True,
             "filename": file.filename,
-            "transcript": transcript,
-            "recap": recap_text
+            "language": result["language"],
+            "language_probability": result[
+                "language_probability"
+            ],
+            "duration": result["duration"],
+            "text": result["text"],
+            "segments": result["segments"],
+            "transcription_engine": "faster-whisper"
         }
 
 
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
+
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg failed to extract audio"
+        )
+
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+    finally:
+
+        if input_path:
+
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
+
+
+        if audio_path:
+
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+
+
+# --------------------------------------------------
+# RECAP
+# --------------------------------------------------
+
+@app.post("/recap")
+def recap(request: RecapRequest):
+
+    recap_text = generate_recap(
+        request.text
+    )
+
+    return {
+        "success": True,
+        "recap": recap_text
+    }
+
+
+# --------------------------------------------------
+# AUTO RECAP
+# FREE WHISPER + TEMPORARY GROQ RECAP
+# --------------------------------------------------
+
+@app.post("/auto-recap")
+async def auto_recap(
+    file: UploadFile = File(...)
+):
+
+    input_suffix = os.path.splitext(
+        file.filename or ""
+    )[1] or ".mp4"
+
+    input_path = None
+    audio_path = None
+
+    try:
+
+        # Save video
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=input_suffix
+        ) as temp:
+
+            temp.write(await file.read())
+            input_path = temp.name
+
+
+        # FFmpeg
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+
+        # Audio file
+
+        audio_temp = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".wav"
+        )
+
+        audio_path = audio_temp.name
+        audio_temp.close()
+
+
+        # Extract audio
+
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                input_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-acodec",
+                "pcm_s16le",
+                audio_path
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+
+        # FREE WHISPER
+
+        transcription = transcribe_audio(
+            audio_path
+        )
+
+        transcript = transcription["text"]
+
+
+        # Generate Myanmar recap
+
+        recap_text = generate_recap(
+            transcript
+        )
+
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "language": transcription["language"],
+            "transcript": transcript,
+            "segments": transcription["segments"],
+            "recap": recap_text,
+            "transcription_engine": "faster-whisper"
+        }
+
+
+    except subprocess.CalledProcessError:
 
         raise HTTPException(
             status_code=500,
